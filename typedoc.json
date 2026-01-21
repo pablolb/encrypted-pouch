@@ -1,0 +1,36 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "out": "docs/api",
+  "plugin": [],
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "excludeExternals": true,
+  "readme": "README.md",
+  "name": "Encrypted Pouch",
+  "navigationLinks": {
+    "GitHub": "https://github.com/pablolb/encrypted-pouch",
+    "Demo": "https://pablolb.github.io/encrypted-pouch/"
+  },
+  "sidebarLinks": {
+    "NPM": "https://www.npmjs.com/package/@mrbelloc/encrypted-pouch"
+  },
+  "sort": ["source-order"],
+  "kindSortOrder": [
+    "Class",
+    "Interface",
+    "TypeAlias",
+    "Function",
+    "Variable"
+  ],
+  "categorizeByGroup": true,
+  "categoryOrder": ["*"],
+  "visibilityFilters": {
+    "protected": false,
+    "private": false,
+    "inherited": true,
+    "external": false
+  },
+  "searchInComments": true,
+  "includeVersion": true
+}

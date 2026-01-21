@@ -1,0 +1,78 @@
+{
+  "name": "@mrbelloc/encrypted-pouch",
+  "version": "0.1.0",
+  "description": "Encrypted document storage with events using PouchDB and AES-256-GCM",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
+    "build": "tsc --project tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "docs": "typedoc",
+    "docs:watch": "typedoc --watch",
+    "prepare": "husky",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "encryption",
+    "storage",
+    "pouchdb",
+    "couchdb",
+    "offline-first",
+    "sync"
+  ],
+  "author": "Pablo de León Belloc <pablolb@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pablolb/encrypted-pouch.git"
+  },
+  "homepage": "https://github.com/pablolb/encrypted-pouch#readme",
+  "bugs": {
+    "url": "https://github.com/pablolb/encrypted-pouch/issues"
+  },
+  "files": [
+    "dist",
+    "!dist/**/__tests__",
+    "README.md"
+  ],
+  "devDependencies": {
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.6",
+    "@types/pouchdb": "^6.4.2",
+    "husky": "^9.1.7",
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^30.2.0",
+    "lint-staged": "^16.2.7",
+    "pouchdb": "^8.0.1",
+    "pouchdb-adapter-memory": "^8.0.1",
+    "prettier": "^3.7.4",
+    "ts-jest": "^29.1.1",
+    "typedoc": "^0.28.16",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "pouchdb-browser": "^8.0.1"
+  },
+  "peerDependencies": {
+    "events": "^3.3.0",
+    "pouchdb-browser": "^8.0.1"
+  },
+  "lint-staged": {
+    "src/**/*.ts": [
+      "prettier --write"
+    ]
+  }
+}

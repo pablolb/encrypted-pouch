@@ -1,0 +1,5 @@
+node_modules
+dist
+.partykit
+*.md
+package-lock.json

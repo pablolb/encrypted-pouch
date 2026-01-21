@@ -1,0 +1,23 @@
+# Test artifacts
+kb-dir-*
+test-*
+*.test.*
+__tests__
+
+# Development files
+src/
+tsconfig*.json
+.husky/
+.git/
+
+# CI/CD
+.github/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.log
+coverage/
+.env*
