@@ -48,6 +48,8 @@ export interface DocRef {
  * Information about a decryption error
  */
 export interface DecryptionErrorEvent {
+  /** Discriminator for the error event kind */
+  kind: "decrypt";
   /** Full PouchDB document ID (table_id format) */
   docId: string;
   /** The error that occurred during decryption */
@@ -55,6 +57,35 @@ export interface DecryptionErrorEvent {
   /** The raw encrypted document from PouchDB */
   rawDoc: any;
 }
+
+/**
+ * Information about a write error from a bulk operation (e.g. putAll).
+ *
+ * Surfaced when an individual document in a batch fails to write, for example
+ * because of a revision conflict on update.
+ */
+export interface WriteErrorEvent {
+  /** Discriminator for the error event kind */
+  kind: "write";
+  /** Full PouchDB document ID (table_id format) */
+  docId: string;
+  /** Document table name */
+  table: string;
+  /** Document ID within the table */
+  id: string;
+  /** The error reported by PouchDB */
+  error: Error;
+  /** The input document that failed to write */
+  doc: NewDoc;
+}
+
+/**
+ * Union of all error events surfaced via {@link PouchListener.onError}.
+ *
+ * Use the `kind` discriminator to distinguish decryption errors from
+ * bulk-write errors.
+ */
+export type ErrorEvent = DecryptionErrorEvent | WriteErrorEvent;
 
 /**
  * Information about a document conflict detected during sync
@@ -134,12 +165,19 @@ export interface PouchListener {
   onSync?: (info: SyncInfo) => void;
 
   /**
-   * Optional callback for decryption errors.
-   * Called when a document fails to decrypt (e.g., wrong password, corrupted data).
+   * Optional callback for error events.
    *
-   * @param errors - Array of decryption errors
+   * Fires for two kinds of error:
+   * - `kind: "decrypt"` — a stored document failed to decrypt
+   *   (wrong password, corrupted ciphertext).
+   * - `kind: "write"` — a document in a bulk write (see {@link EncryptedPouch.putAll})
+   *   was rejected by PouchDB (e.g. a revision conflict).
+   *
+   * Use the `kind` discriminator to handle each case.
+   *
+   * @param errors - Array of error events
    */
-  onError?: (errors: DecryptionErrorEvent[]) => void;
+  onError?: (errors: ErrorEvent[]) => void;
 }
 
 /**
@@ -291,6 +329,7 @@ export class EncryptedPouch {
             }
           } catch (error) {
             errors.push({
+              kind: "decrypt",
               docId: encryptedDoc._id,
               error: error instanceof Error ? error : new Error(String(error)),
               rawDoc: encryptedDoc,
@@ -363,6 +402,80 @@ export class EncryptedPouch {
     const result = await this.db.put(encryptedDoc);
 
     return { ...doc, _id: doc._id, _rev: result.rev };
+  }
+
+  /**
+   * Writes multiple documents to a table in a single bulk operation.
+   *
+   * Documents without an `_id` get one auto-generated. Documents with an `_id`
+   * are upserted: include `_rev` to update an existing document, omit it to
+   * create a new one (a stale or missing `_rev` on an existing document
+   * surfaces as a write error via {@link PouchListener.onError} with
+   * `kind: "write"`, while the rest of the batch still succeeds).
+   *
+   * Successful writes flow through the existing changes feed and are reported
+   * via {@link PouchListener.onChange}, batched per table.
+   *
+   * @param table - Document table name
+   * @param docs - Documents to write
+   *
+   * @example
+   * ```typescript
+   * await store.putAll('expenses', [
+   *   { _id: 'lunch', amount: 15 },
+   *   { _id: 'dinner', amount: 25 },
+   *   { amount: 5 }, // _id auto-generated
+   * ]);
+   * ```
+   */
+  async putAll(table: string, docs: NewDoc[]): Promise<void> {
+    if (docs.length === 0) return;
+
+    const encryptedDocs: EncryptedDoc[] = [];
+    const inputByFullId = new Map<string, NewDoc>();
+
+    for (const doc of docs) {
+      if (!doc._id) {
+        doc._id =
+          crypto.randomUUID?.() ||
+          `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      }
+      const fullId = `${table}_${doc._id}`;
+      const encryptedDoc = await this.encryptDoc(doc, fullId);
+      if ("_rev" in doc && doc._rev) {
+        encryptedDoc._rev = doc._rev;
+      }
+      encryptedDocs.push(encryptedDoc);
+      inputByFullId.set(fullId, doc);
+    }
+
+    const results = await this.db.bulkDocs(encryptedDocs);
+
+    const writeErrors: WriteErrorEvent[] = [];
+    for (const result of results) {
+      if ("error" in result && result.error) {
+        const fullId = result.id ?? "";
+        const parsed = this.parseFullId(fullId);
+        const inputDoc = inputByFullId.get(fullId);
+        if (parsed && inputDoc) {
+          writeErrors.push({
+            kind: "write",
+            docId: fullId,
+            table: parsed.table,
+            id: parsed.id,
+            error:
+              result instanceof Error
+                ? result
+                : new Error(result.message || result.name || "Write failed"),
+            doc: inputDoc,
+          });
+        }
+      }
+    }
+
+    if (writeErrors.length > 0 && this.listener.onError) {
+      this.listener.onError(writeErrors);
+    }
   }
 
   /**
@@ -576,6 +689,7 @@ export class EncryptedPouch {
           }
         } catch (error) {
           errors.push({
+            kind: "decrypt",
             docId: encryptedDoc._id,
             error: error instanceof Error ? error : new Error(String(error)),
             rawDoc: encryptedDoc,
@@ -914,6 +1028,7 @@ export class EncryptedPouch {
       }
     } catch (error) {
       errors.push({
+        kind: "decrypt",
         docId: encryptedDoc._id,
         error: error instanceof Error ? error : new Error(String(error)),
         rawDoc: encryptedDoc,
@@ -951,6 +1066,7 @@ export class EncryptedPouch {
         losers.push(decrypted);
       } catch (error) {
         errors.push({
+          kind: "decrypt",
           docId: `${fullId}@${rev}`,
           error: error instanceof Error ? error : new Error(String(error)),
           rawDoc: { _id: fullId, _rev: rev },

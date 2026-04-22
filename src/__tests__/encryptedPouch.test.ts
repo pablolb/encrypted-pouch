@@ -15,13 +15,18 @@ import MemoryAdapter from "pouchdb-adapter-memory";
 
 // Note: Tests use 'pouchdb' with memory adapter (Node.js environment)
 // Your app should use 'pouchdb-browser' in the browser
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
 import { EncryptedPouch } from "../encryptedPouch.js";
+import { VERSION } from "../version.js";
 import type {
   Doc,
   DocRef,
   ConflictInfo,
   SyncInfo,
   DecryptionErrorEvent,
+  ErrorEvent,
 } from "../encryptedPouch.js";
 
 // Use memory adapter for tests
@@ -609,6 +614,165 @@ describe("EncryptedPouch", () => {
         }),
       ).rejects.toThrow(/doc_validation|Bad special document member/);
     });
+  });
+
+  describe("Bulk Operations", () => {
+    test("putAll should write multiple documents to a table", async () => {
+      store = new EncryptedPouch(db, "test-password");
+      await store.loadAll();
+
+      await store.putAll("expenses", [
+        { _id: "lunch", amount: 15 },
+        { _id: "dinner", amount: 25 },
+        { _id: "coffee", amount: 5 },
+      ]);
+
+      expect((await store.get("expenses", "lunch"))?.amount).toBe(15);
+      expect((await store.get("expenses", "dinner"))?.amount).toBe(25);
+      expect((await store.get("expenses", "coffee"))?.amount).toBe(5);
+    });
+
+    test("putAll should auto-generate IDs for docs without _id", async () => {
+      store = new EncryptedPouch(db, "test-password");
+      await store.loadAll();
+
+      await store.putAll("expenses", [{ amount: 15 }, { amount: 25 }]);
+
+      const all = await store.getAll("expenses");
+      expect(all).toHaveLength(2);
+      expect(
+        all.every((d) => typeof d._id === "string" && d._id.length > 0),
+      ).toBe(true);
+      const amounts = all.map((d) => d.amount).sort();
+      expect(amounts).toEqual([15, 25]);
+    });
+
+    test("putAll with empty array is a no-op", async () => {
+      store = new EncryptedPouch(db, "test-password");
+      await store.loadAll();
+      await expect(store.putAll("expenses", [])).resolves.toBeUndefined();
+    });
+
+    test("putAll fires onChange for each written document", async () => {
+      const onChange =
+        jest.fn<(changes: Array<{ table: string; docs: Doc[] }>) => void>();
+      store = new EncryptedPouch(db, "test-password", {
+        onChange,
+        onDelete: jest.fn(),
+      });
+      await store.loadAll();
+      onChange.mockClear();
+
+      await store.putAll("expenses", [
+        { _id: "lunch", amount: 15 },
+        { _id: "dinner", amount: 25 },
+      ]);
+
+      await waitFor(() => {
+        const seenIds = new Set<string>();
+        for (const [changes] of onChange.mock.calls) {
+          for (const c of changes) {
+            if (c.table === "expenses") {
+              for (const d of c.docs) seenIds.add(d._id);
+            }
+          }
+        }
+        return seenIds.has("lunch") && seenIds.has("dinner");
+      });
+    });
+
+    test("putAll fires one onChange per written doc (no batching today)", async () => {
+      // Documents the current behavior: putAll relies on the changes feed,
+      // which delivers one change at a time. A bulk write of N docs therefore
+      // produces N onChange invocations. If we add batching later, this test
+      // is the canary.
+      const onChange =
+        jest.fn<(changes: Array<{ table: string; docs: Doc[] }>) => void>();
+      store = new EncryptedPouch(db, "test-password", {
+        onChange,
+        onDelete: jest.fn(),
+      });
+      await store.loadAll();
+      onChange.mockClear();
+
+      await store.putAll("expenses", [
+        { _id: "lunch", amount: 15 },
+        { _id: "dinner", amount: 25 },
+        { _id: "coffee", amount: 5 },
+      ]);
+
+      await waitFor(() => onChange.mock.calls.length >= 3);
+      expect(onChange).toHaveBeenCalledTimes(3);
+      for (const [changes] of onChange.mock.calls) {
+        expect(changes).toHaveLength(1);
+        expect(changes[0].docs).toHaveLength(1);
+      }
+    });
+
+    test("putAll surfaces write conflicts via onError with kind 'write'", async () => {
+      const onError = jest.fn<(errors: ErrorEvent[]) => void>();
+      store = new EncryptedPouch(db, "test-password", {
+        onChange: jest.fn(),
+        onDelete: jest.fn(),
+        onError,
+      });
+      await store.loadAll();
+
+      // Seed an existing doc
+      await store.putAll("expenses", [{ _id: "lunch", amount: 15 }]);
+      onError.mockClear();
+
+      // Second batch: lunch will conflict (no _rev), dinner should still succeed
+      await store.putAll("expenses", [
+        { _id: "lunch", amount: 20 },
+        { _id: "dinner", amount: 25 },
+      ]);
+
+      expect(onError).toHaveBeenCalled();
+      const errors = onError.mock.calls.flatMap((c) => c[0]);
+      const writeErrs = errors.filter((e) => e.kind === "write");
+      expect(writeErrs).toHaveLength(1);
+      const writeErr = writeErrs[0];
+      if (writeErr.kind !== "write") throw new Error("expected write kind");
+      expect(writeErr.table).toBe("expenses");
+      expect(writeErr.id).toBe("lunch");
+      expect(writeErr.docId).toBe("expenses_lunch");
+      expect(writeErr.error).toBeInstanceOf(Error);
+      expect(writeErr.doc.amount).toBe(20);
+
+      // Non-conflicting doc still written
+      expect((await store.get("expenses", "dinner"))?.amount).toBe(25);
+      // Original doc not overwritten
+      expect((await store.get("expenses", "lunch"))?.amount).toBe(15);
+    });
+
+    test("decryption errors carry kind 'decrypt'", async () => {
+      await db.put({
+        _id: "expenses_lunch",
+        d: "invalid-encrypted-data",
+      });
+
+      const onError = jest.fn<(errors: ErrorEvent[]) => void>();
+      store = new EncryptedPouch(db, "test-password", {
+        onChange: jest.fn(),
+        onDelete: jest.fn(),
+        onError,
+      });
+      await store.loadAll();
+
+      expect(onError).toHaveBeenCalled();
+      const errors = onError.mock.calls[0][0];
+      expect(errors[0].kind).toBe("decrypt");
+    });
+  });
+});
+
+describe("VERSION", () => {
+  test("matches package.json version", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = resolve(here, "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    expect(VERSION).toBe(pkg.version);
   });
 });
 

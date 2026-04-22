@@ -1,6 +1,6 @@
 {
   "name": "@mrbelloc/encrypted-pouch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Encrypted document storage with events using PouchDB and AES-256-GCM",
   "type": "module",
   "main": "dist/index.js",

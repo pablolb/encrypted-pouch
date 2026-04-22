@@ -7,8 +7,12 @@
 export { EncryptedPouch } from "./encryptedPouch.js";
 export type {
   Doc,
+  NewDoc,
+  DocRef,
   PouchListener,
   DecryptionErrorEvent,
+  WriteErrorEvent,
+  ErrorEvent,
   ConflictInfo,
   SyncInfo,
   RemoteOptions,
@@ -18,7 +22,7 @@ export type {
 export { EncryptionHelper, DecryptionError } from "./encryption.js";
 export type { CryptoInterface } from "./encryption.js";
 
-export const VERSION = "2.1.0";
+export { VERSION } from "./version.js";
 
 // Re-export PouchDB for convenience
 // Use pouchdb-browser for Vite/browser compatibility

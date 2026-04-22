@@ -20,7 +20,7 @@ Perfect for personal productivity apps, expense trackers, note-taking apps, etc.
 ## Features
 
 - 🔐 AES-256-GCM encryption with WebCrypto API
-- 📦 Simple document API: `put`, `get`, `delete`, `getAll`
+- 📦 Simple document API: `put`, `putAll`, `get`, `delete`, `getAll`
 - 🔄 Real-time events (`onChange`, `onDelete`, `onConflict`, `onSync`, `onError`)
 - 🌐 Sync to CouchDB or Cloudant
 - 🔌 Offline-first with automatic retry
@@ -74,6 +74,13 @@ await store.put('expenses', {
   amount: 15.50,
   date: '2024-01-15'
 });
+
+// Bulk insert (e.g. importing from CSV or seeding)
+await store.putAll('expenses', [
+  { _id: 'breakfast', amount: 8.00,  date: '2024-01-15' },
+  { _id: 'dinner',    amount: 25.00, date: '2024-01-15' },
+  { amount: 5.00, date: '2024-01-15' }, // _id auto-generated
+]);
 
 // Get a document
 const expense = await store.get('expenses', 'lunch');
@@ -135,6 +142,31 @@ await store.put('users', {
 ```
 
 **Best Practice:** Use normal field names (no `_` prefix) for all your data. PouchDB will reject unknown `_` fields anyway.
+
+## Error Events
+
+`onError` receives a discriminated union — use the `kind` field to tell what went wrong:
+
+```typescript
+const store = new EncryptedPouch(db, password, {
+  onChange,
+  onDelete,
+  onError: (errors) => {
+    for (const err of errors) {
+      if (err.kind === 'decrypt') {
+        // A stored document failed to decrypt (wrong password, corrupted ciphertext)
+        console.error('decrypt failed:', err.docId, err.error);
+      } else {
+        // A document in a putAll batch was rejected by PouchDB
+        // (e.g. revision conflict on update). The rest of the batch still committed.
+        console.error('write failed:', err.table, err.id, err.error, err.doc);
+      }
+    }
+  },
+});
+```
+
+Successful writes — including those from `putAll` — are reported through `onChange`, not here.
 
 ## Sync to Cloudant (Free Tier)
 
