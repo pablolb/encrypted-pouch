@@ -295,48 +295,70 @@ export class EncryptedPouch {
         conflicts: true,
       });
 
+      // Decrypt every doc in parallel. The previous sequential `await` per
+      // row was the dominant cost on large datasets — WebCrypto can handle
+      // many concurrent AES-GCM operations cheaply, so kicking them all off
+      // at once and letting the runtime batch is dramatically faster than
+      // walking them one by one (~1–2ms round-trip × N docs adds up).
+      const decryptions = await Promise.all(
+        result.rows.map(async (row) => {
+          if (!row.doc || row.id.startsWith("_design/")) return null;
+          const enc = row.doc as EncryptedDoc & { _conflicts?: string[] };
+          if (!enc.d) return null;
+          try {
+            const doc = await this.decryptDoc(enc);
+            return { enc, doc, error: null as Error | null };
+          } catch (error) {
+            return {
+              enc,
+              doc: null as Doc | null,
+              error: error instanceof Error ? error : new Error(String(error)),
+            };
+          }
+        }),
+      );
+
       const docsByTable = new Map<string, Doc[]>();
       const errors: DecryptionErrorEvent[] = [];
-      const conflicts: ConflictInfo[] = [];
+      const conflictInputs: Array<{
+        enc: EncryptedDoc & { _conflicts?: string[] };
+        doc: Doc;
+      }> = [];
 
-      for (const row of result.rows) {
-        if (!row.doc || row.id.startsWith("_design/")) continue;
-
-        const encryptedDoc = row.doc as EncryptedDoc & {
-          _conflicts?: string[];
-        };
-
-        if (encryptedDoc.d) {
-          try {
-            const doc = await this.decryptDoc(encryptedDoc);
-            const parsed = this.parseFullId(encryptedDoc._id);
-            if (parsed) {
-              if (!docsByTable.has(parsed.table)) {
-                docsByTable.set(parsed.table, []);
-              }
-              docsByTable.get(parsed.table)!.push(doc);
-            }
-
-            // Check for conflicts
-            if (encryptedDoc._conflicts && encryptedDoc._conflicts.length > 0) {
-              const conflictInfo = await this.buildConflictInfo(
-                encryptedDoc._id,
-                encryptedDoc._rev!,
-                encryptedDoc._conflicts,
-                doc,
-              );
-              conflicts.push(conflictInfo);
-            }
-          } catch (error) {
-            errors.push({
-              kind: "decrypt",
-              docId: encryptedDoc._id,
-              error: error instanceof Error ? error : new Error(String(error)),
-              rawDoc: encryptedDoc,
-            });
+      for (const item of decryptions) {
+        if (!item) continue;
+        if (item.error) {
+          errors.push({
+            kind: "decrypt",
+            docId: item.enc._id,
+            error: item.error,
+            rawDoc: item.enc,
+          });
+          continue;
+        }
+        const parsed = this.parseFullId(item.enc._id);
+        if (parsed) {
+          if (!docsByTable.has(parsed.table)) {
+            docsByTable.set(parsed.table, []);
           }
+          docsByTable.get(parsed.table)!.push(item.doc!);
+        }
+        if (item.enc._conflicts && item.enc._conflicts.length > 0) {
+          conflictInputs.push({ enc: item.enc, doc: item.doc! });
         }
       }
+
+      // Conflict resolution is also a string of decrypts — parallelize too.
+      const conflicts = await Promise.all(
+        conflictInputs.map((c) =>
+          this.buildConflictInfo(
+            c.enc._id,
+            c.enc._rev!,
+            c.enc._conflicts!,
+            c.doc,
+          ),
+        ),
+      );
 
       if (docsByTable.size > 0) {
         const changes = Array.from(docsByTable.entries()).map(
