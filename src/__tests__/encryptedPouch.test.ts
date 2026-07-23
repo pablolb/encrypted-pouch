@@ -18,7 +18,7 @@ import MemoryAdapter from "pouchdb-adapter-memory";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, resolve } from "path";
-import { EncryptedPouch } from "../encryptedPouch.js";
+import { EncryptedPouch, BACKUP_DUMP_VERSION } from "../encryptedPouch.js";
 import { VERSION } from "../version.js";
 import type {
   Doc,
@@ -764,6 +764,127 @@ describe("EncryptedPouch", () => {
       const errors = onError.mock.calls[0][0];
       expect(errors[0].kind).toBe("decrypt");
     });
+  });
+});
+
+describe("Backup and restore", () => {
+  const dbs: PouchDB.Database[] = [];
+  const makeDb = () => {
+    const db = new PouchDB(`backup-${Math.random().toString(36).slice(2)}`, {
+      adapter: "memory",
+    });
+    dbs.push(db);
+    return db;
+  };
+
+  afterEach(async () => {
+    await Promise.all(dbs.map((d) => d.destroy().catch(() => {})));
+    dbs.length = 0;
+  });
+
+  async function seed(
+    db: PouchDB.Database,
+    password = "pw",
+  ): Promise<EncryptedPouch> {
+    const store = new EncryptedPouch(db, password);
+    await store.loadAll();
+    await store.put("transaction", { _id: "t1", amount: 100 });
+    await store.put("transaction", { _id: "t2", amount: 200 });
+    await store.put("settings", { _id: "settings-abc", theme: "dark" });
+    await store.put("commodity-price", { _id: "price:ARS:USD", sell: "0.001" });
+    return store;
+  }
+
+  test("export groups decrypted docs by table and strips _rev", async () => {
+    const store = await seed(makeDb());
+    const dump = await store.export();
+
+    expect(dump.version).toBe(BACKUP_DUMP_VERSION);
+    expect(Object.keys(dump.tables).sort()).toEqual([
+      "commodity-price",
+      "settings",
+      "transaction",
+    ]);
+    expect(dump.tables.transaction).toHaveLength(2);
+    for (const docs of Object.values(dump.tables)) {
+      for (const doc of docs) {
+        expect(doc).not.toHaveProperty("_rev");
+        expect(doc._id).toBeDefined();
+      }
+    }
+  });
+
+  test("export can restrict to a subset of tables", async () => {
+    const store = await seed(makeDb());
+    const dump = await store.export({ tables: ["transaction"] });
+    expect(Object.keys(dump.tables)).toEqual(["transaction"]);
+    expect(dump.tables.transaction).toHaveLength(2);
+  });
+
+  test("round-trips through loadFromJSONBackup into a fresh store", async () => {
+    const source = await seed(makeDb());
+    const dump = await source.export();
+
+    const target = new EncryptedPouch(makeDb(), "pw");
+    await target.loadFromJSONBackup(dump);
+    // A separate load confirms the docs persisted and decrypt under the password.
+    await target.loadAll();
+
+    const txns = await target.getAll("transaction");
+    expect(txns.map((t) => t._id).sort()).toEqual(["t1", "t2"]);
+    const prices = await target.getAll("commodity-price");
+    expect(prices[0]).toMatchObject({ _id: "price:ARS:USD", sell: "0.001" });
+  });
+
+  test("loadFromJSONBackup refuses a non-empty store", async () => {
+    const store = await seed(makeDb());
+    const dump = await store.export();
+    await expect(store.loadFromJSONBackup(dump)).rejects.toThrow(/empty store/);
+  });
+
+  test("destroy removes the database entirely (no tombstones)", async () => {
+    const db = makeDb();
+    const store = await seed(db);
+    await store.destroy();
+
+    const reopened = new PouchDB(db.name, { adapter: "memory" });
+    dbs.push(reopened);
+    const info = await reopened.info();
+    expect(info.doc_count).toBe(0);
+  });
+
+  test("verifyPassword accepts the correct password, rejects a wrong one", async () => {
+    const db = makeDb();
+    await seed(db, "correct-horse");
+    expect(await EncryptedPouch.verifyPassword(db, "correct-horse")).toBe(true);
+    expect(await EncryptedPouch.verifyPassword(db, "wrong")).toBe(false);
+  });
+
+  test("verifyPassword returns true for an empty database", async () => {
+    expect(await EncryptedPouch.verifyPassword(makeDb(), "anything")).toBe(
+      true,
+    );
+  });
+
+  test("verifyPassword skips a leading non-encrypted doc and still checks ciphertext", async () => {
+    const db = makeDb();
+    await seed(db, "correct-horse");
+    // A raw doc with no encrypted `d`, whose id sorts before the encrypted ones.
+    await db.put({ _id: "aaa_raw", note: "not encrypted" });
+
+    // The leading plaintext doc must not cause a wrong password to be accepted.
+    expect(await EncryptedPouch.verifyPassword(db, "wrong")).toBe(false);
+    expect(await EncryptedPouch.verifyPassword(db, "correct-horse")).toBe(true);
+  });
+
+  test("loadFromJSONBackup rejects a dump from a newer schema version", async () => {
+    const target = new EncryptedPouch(makeDb(), "pw");
+    await expect(
+      target.loadFromJSONBackup({
+        version: BACKUP_DUMP_VERSION + 1,
+        tables: {},
+      }),
+    ).rejects.toThrow(/version/i);
   });
 });
 

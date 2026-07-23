@@ -218,6 +218,25 @@ interface EncryptedDoc {
   d: string;
 }
 
+/** Current {@link BackupDump} schema version. */
+export const BACKUP_DUMP_VERSION = 1;
+
+/**
+ * A plaintext, re-loadable snapshot of a database: every document, decrypted and
+ * grouped by table, with `_rev` stripped (a per-database storage detail that does
+ * not survive a move to another database).
+ *
+ * Produced by {@link EncryptedPouch.export} and consumed by
+ * {@link EncryptedPouch.loadFromJSONBackup}. Serialize it to JSON for an
+ * off-device backup; the caller owns any outer envelope/metadata.
+ */
+export interface BackupDump {
+  /** Dump schema version (see {@link BACKUP_DUMP_VERSION}). */
+  version: number;
+  /** table name → its documents (logical `_id`, no `_rev`). */
+  tables: Record<string, NewDoc[]>;
+}
+
 /**
  * Encrypted document store with change detection and sync capabilities.
  *
@@ -725,6 +744,178 @@ export class EncryptedPouch {
     }
 
     return docs;
+  }
+
+  /**
+   * Export every document (or a subset of tables) as a plaintext, re-loadable
+   * {@link BackupDump} — decrypted, grouped by table, with `_rev` stripped. The
+   * basis of a full backup; pair it with {@link loadFromJSONBackup} to restore.
+   *
+   * Tables are discovered from the stored documents themselves (their `table_id`
+   * ids), so a dump is complete without the caller enumerating table names — the
+   * key reason backup belongs in the library. Design documents are skipped.
+   * Decryption failures surface via `onError` (like {@link getAll}) and the
+   * offending document is omitted.
+   *
+   * @param opts.tables - Restrict the dump to these tables (default: all).
+   */
+  async export(opts?: { tables?: string[] }): Promise<BackupDump> {
+    const only = opts?.tables ? new Set(opts.tables) : null;
+    const result = await this.db.allDocs({ include_docs: true });
+    const tables: Record<string, NewDoc[]> = {};
+    const errors: DecryptionErrorEvent[] = [];
+
+    // Decrypt in parallel — a backup runs over the whole database, and a
+    // sequential `await` per row dominates cost at scale (the same reason
+    // loadAll decrypts in parallel). Order within a table is not significant.
+    const decrypted = await Promise.all(
+      result.rows.map(async (row) => {
+        if (!row.doc || row.id.startsWith("_design/")) return null;
+        const enc = row.doc as EncryptedDoc;
+        if (!enc.d) return null;
+        const parsed = this.parseFullId(enc._id);
+        if (!parsed || (only && !only.has(parsed.table))) return null;
+        try {
+          return { table: parsed.table, doc: await this.decryptDoc(enc) };
+        } catch (error) {
+          errors.push({
+            kind: "decrypt",
+            docId: enc._id,
+            error: error instanceof Error ? error : new Error(String(error)),
+            rawDoc: enc,
+          });
+          return null;
+        }
+      }),
+    );
+
+    for (const item of decrypted) {
+      if (!item) continue;
+      // Strip _rev — meaningless once the doc moves to another database.
+      const { _rev: _drop, ...rest } = item.doc;
+      (tables[item.table] ??= []).push(rest as NewDoc);
+    }
+
+    if (errors.length > 0 && this.listener.onError) {
+      this.listener.onError(errors);
+    }
+
+    return { version: BACKUP_DUMP_VERSION, tables };
+  }
+
+  /**
+   * Load a {@link BackupDump} into THIS store, which **must be empty** (a freshly
+   * created database). Each table is written in one bulk `putAll`, then every
+   * table's document count is re-read and compared against the dump — a mismatch
+   * throws, so a per-document `putAll` failure can never silently lose data.
+   *
+   * Restore is deliberately "create a fresh database, then load", never "wipe an
+   * existing database, then load": {@link deleteAllLocal} leaves tombstones, and
+   * re-`put`ting a document with the same id but no `_rev` would 409 against the
+   * tombstone. A pristine store makes that whole class of conflict impossible.
+   *
+   * On a thrown count check the store may be left **partially populated** — the
+   * caller should {@link destroy} the fresh database rather than reuse it.
+   *
+   * @throws {Error} if `dump.version` is newer than this build understands, if
+   *   the store is non-empty, or if any document fails to write.
+   */
+  async loadFromJSONBackup(dump: BackupDump): Promise<void> {
+    if (dump.version > BACKUP_DUMP_VERSION) {
+      throw new Error(
+        `Unsupported backup version ${dump.version}; this build understands up to ${BACKUP_DUMP_VERSION}`,
+      );
+    }
+
+    const existing = await this.db.allDocs();
+    if (existing.rows.some((r) => !r.id.startsWith("_design/"))) {
+      throw new Error(
+        "loadFromJSONBackup requires an empty store; found existing documents",
+      );
+    }
+
+    for (const [table, docs] of Object.entries(dump.tables)) {
+      if (docs.length === 0) continue;
+      // Fresh store ⇒ every write is an unambiguous create; drop any stray _rev.
+      const toWrite = docs.map(({ _rev: _drop, ...rest }) => rest);
+      await this.putAll(table, toWrite);
+    }
+
+    // putAll is best-effort per document (failures surface via onError, not by
+    // throwing) — verify per-table counts so an incomplete restore fails loudly.
+    // A key-range count over the `${table}_` id prefix avoids decrypting every
+    // doc just to tally it (the `_` separator keeps tables from colliding).
+    for (const [table, docs] of Object.entries(dump.tables)) {
+      const range = await this.db.allDocs({
+        startkey: `${table}_`,
+        endkey: `${table}_` + "\ufff0",
+      });
+      if (range.rows.length !== docs.length) {
+        throw new Error(
+          `Restore incomplete for table "${table}": expected ${docs.length}, wrote ${range.rows.length}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Permanently delete the underlying database and stop change detection.
+   *
+   * Unlike {@link deleteAllLocal} (which tombstones every document, leaving
+   * deleted leaves that could conflict with a later re-`put`), this removes the
+   * database outright — no tombstones remain. Use it to discard a throwaway /
+   * dry-run database, or to clean up the old database after restoring into a new
+   * one. The instance is unusable afterward.
+   */
+  async destroy(): Promise<void> {
+    this.disconnectRemote();
+    if (this.changesHandler) {
+      this.changesHandler.cancel();
+      this.changesHandler = null;
+    }
+    await this.db.destroy();
+  }
+
+  /**
+   * Check whether `password` can decrypt an existing database, without opening a
+   * persistent store or attaching a change feed — it reads at most one stored
+   * document and attempts to decrypt it.
+   *
+   * Returns `true` if a document decrypts, `false` if decryption fails (wrong
+   * password). A database with no encrypted documents returns `true`: a
+   * passphrase cannot be disproven against zero ciphertext. Intended as a
+   * "confirm your passphrase before a destructive action" gate — the caller opens
+   * a handle to the current database and passes it in.
+   *
+   * @param options.passphraseMode - Must match how the database was written
+   *   (default `"derive"`).
+   */
+  static async verifyPassword(
+    db: PouchDB.Database,
+    password: string,
+    options?: EncryptedPouchOptions,
+  ): Promise<boolean> {
+    const helper = new EncryptionHelper(
+      password,
+      undefined,
+      options?.passphraseMode || "derive",
+    );
+    const listing = await db.allDocs();
+    for (const row of listing.rows) {
+      if (row.id.startsWith("_design/")) continue;
+      const enc = (await db.get(row.id)) as EncryptedDoc;
+      // Skip documents with no encrypted payload — they prove nothing about the
+      // password, and stopping at one would let a leading plaintext doc accept
+      // any passphrase. Keep scanning for the first real ciphertext.
+      if (!enc.d) continue;
+      try {
+        await helper.decrypt(enc.d);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return true; // No ciphertext to check against.
   }
 
   /**

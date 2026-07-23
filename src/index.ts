@@ -4,7 +4,7 @@
  * @packageDocumentation
  */
 
-export { EncryptedPouch } from "./encryptedPouch.js";
+export { EncryptedPouch, BACKUP_DUMP_VERSION } from "./encryptedPouch.js";
 export type {
   Doc,
   NewDoc,
@@ -17,6 +17,7 @@ export type {
   SyncInfo,
   RemoteOptions,
   EncryptedPouchOptions,
+  BackupDump,
 } from "./encryptedPouch.js";
 
 export { EncryptionHelper, DecryptionError } from "./encryption.js";

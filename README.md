@@ -168,6 +168,37 @@ const store = new EncryptedPouch(db, password, {
 
 Successful writes — including those from `putAll` — are reported through `onChange`, not here.
 
+## Backup & Restore
+
+Export a plaintext, re-loadable snapshot of every document (decrypted, grouped by
+table, `_rev` stripped), and restore it into a **fresh** database. Tables are
+discovered from the stored documents, so a dump is complete without listing table
+names.
+
+```typescript
+// Back up everything (or pass { tables: [...] } for a subset).
+const dump = await store.export();
+downloadJson(JSON.stringify({ version: 1, ...dump }));
+
+// Restore into a NEW database. Restore is always "create fresh, then load" —
+// never "wipe, then load": deleteAllLocal() leaves tombstones, and re-putting an
+// id without a _rev would conflict with them. A pristine store avoids that.
+const freshDb = new PouchDB('myapp-restored'); // must not already have data
+const restored = new EncryptedPouch(freshDb, password);
+await restored.loadFromJSONBackup(dump); // throws if the store isn't empty,
+                                         // or if any doc fails to write
+await restored.loadAll();
+
+// Confirm a passphrase before a destructive action, without opening a store:
+if (!(await EncryptedPouch.verifyPassword(currentDb, typedPassword))) {
+  throw new Error('Wrong passphrase');
+}
+
+// Hard-delete a database (no tombstones) — e.g. a throwaway dry-run, or the old
+// database after restoring into a new one.
+await throwaway.destroy();
+```
+
 ## Sync to Cloudant (Free Tier)
 
 IBM Cloudant offers a free tier: 1GB storage, 20 req/sec.
